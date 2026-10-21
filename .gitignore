@@ -1,0 +1,6 @@
+# 运行期生成的文件，绝对不要提交
+xray-links.txt
+config.json
+*.bak
+*.bak.*
+*.log
