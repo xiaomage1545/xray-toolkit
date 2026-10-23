@@ -194,8 +194,8 @@ install_reality() {
   fi
   echo "本次使用端口：$port"
 
-  read -rp "REALITY 伪装域名 [www.microsoft.com]: " server_name || return 1
-  server_name="${server_name:-www.microsoft.com}"
+  read -rp "REALITY 伪装域名 [www.cloudflare.com]: " server_name || return 1
+  server_name="${server_name:-www.cloudflare.com}"
   [[ "$server_name" =~ ^[A-Za-z0-9.-]+$ ]] || { err "域名格式不正确。"; return 1; }
 
   read -rp "是否同时开启 SOCKS5（公网 + 随机账号密码）？[Y/n]: " want_socks || return 1
