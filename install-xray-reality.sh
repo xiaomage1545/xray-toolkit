@@ -194,8 +194,8 @@ install_reality() {
   fi
   echo "本次使用端口：$port"
 
-  read -rp "REALITY 伪装域名 [www.cloudflare.com]: " server_name || return 1
-  server_name="${server_name:-www.cloudflare.com}"
+  read -rp "REALITY 伪装域名 [www.microsoft.com]: " server_name || return 1
+  server_name="${server_name:-www.microsoft.com}"
   [[ "$server_name" =~ ^[A-Za-z0-9.-]+$ ]] || { err "域名格式不正确。"; return 1; }
 
   read -rp "是否同时开启 SOCKS5（公网 + 随机账号密码）？[Y/n]: " want_socks || return 1
@@ -903,12 +903,24 @@ show_status() {
 
 # ============ 快捷命令 ============
 
-install_shortcuts() {
-  local n
-  for n in xr xray-menu xray-links; do
-    ln -sf "$SELF" "/usr/local/bin/$n" 2>/dev/null || true
+install_shortcuts() {   # 写成真实的小包装脚本，不依赖本文件的执行位
+  local self_real="${SELF:-$0}" n
+  [[ -f "$self_real" ]] || { err "找不到脚本自身：$self_real"; return 1; }
+  bash -n "$self_real" 2>/dev/null || { err "脚本语法有误，拒绝安装快捷命令。"; return 1; }
+
+  for n in xr xray-menu; do
+    rm -f "/usr/local/bin/$n"
+    printf '#!/bin/sh\nT="%s"\n[ -f "$T" ] || { echo "找不到 $T，请重新 clone 仓库" >&2; exit 1; }\nexec bash "$T" "$@"\n' \
+      "$self_real" > "/usr/local/bin/$n" || { err "写入 /usr/local/bin/$n 失败"; return 1; }
+    chmod 755 "/usr/local/bin/$n"
   done
-  dim "快捷命令：xr（菜单）/ xray-menu（菜单）/ xray-links（直接看链接）"
+
+  rm -f /usr/local/bin/xray-links
+  printf '#!/bin/sh\nT="%s"\n[ -f "$T" ] || { echo "找不到 $T，请重新 clone 仓库" >&2; exit 1; }\nexec bash "$T" links "$@"\n' \
+    "$self_real" > /usr/local/bin/xray-links || { err "写入 xray-links 失败"; return 1; }
+  chmod 755 /usr/local/bin/xray-links
+
+  ok "快捷命令已就绪：xr / xray-menu（菜单）、xray-links（直接看链接）"
 }
 
 # ============ 主菜单 ============
@@ -936,6 +948,8 @@ show_main_menu() {
 
 main_menu() {
   local c
+  # 每次运行都自愈一次，网页上传丢掉执行位也不会影响 xr 可用
+  install_shortcuts >/dev/null 2>&1 || true
   while true; do
     show_main_menu
     if ! read -rp "请选择 [1-6]: " c; then echo; break; fi
