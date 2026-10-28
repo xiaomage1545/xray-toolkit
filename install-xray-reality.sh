@@ -391,11 +391,7 @@ EOF
   echo "$link"
   echo
   if (( enable_socks )); then
-    echo "SOCKS5"
-    echo "地址: $server_addr"
-    echo "端口: $socks_port"
-    echo "用户名: $socks_user"
-    echo "密码: $socks_pass"
+    echo "$server_addr:$socks_port:$socks_user:$socks_pass"
     echo "链接: $(build_socks_link "$server_addr" "$socks_port" "$socks_user" "$socks_pass")"
     echo
     dim "注意：SOCKS5 是明文协议，只能自己用。"
