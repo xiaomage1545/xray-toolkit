@@ -17,9 +17,9 @@ PF_STATE="/etc/port-forward.rules"
 SYSCTL_CONF="/etc/sysctl.d/99-port-forward.conf"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
-# 默认安装官方最新版。若客户端不兼容（26.x 的 REALITY 与 Shadowrocket 等），
-# 可临时固定旧版：XRAY_VERSION=1.8.24 bash 本脚本
-XRAY_VERSION="${XRAY_VERSION:-}"
+# 固定 Xray-core 版本：实测 26.6.22 与 Shadowrocket 兼容，26.10.x 会握手失败，1.8.x 已过旧。
+# 想试最新版：XRAY_VERSION= bash 本脚本
+XRAY_VERSION="${XRAY_VERSION:-26.6.22}"
 
 # 临时文件用全局变量，保证 EXIT trap 在函数返回后仍能正确清理
 TMP_INSTALLER=""
@@ -480,10 +480,11 @@ show_links() {
     found=1
     echo
     echo "SOCKS5"
-    echo "地址: $host"
-    echo "端口: $port"
-    echo "用户名: ${user:--}"
-    echo "密码: ${pass:--}"
+    if [[ -n "$user" ]]; then
+      echo "$host:$port:$user:$pass"
+    else
+      echo "$host:$port"
+    fi
     link="$(build_socks_link "$host" "$port" "$user" "$pass")"
     echo "链接: $link"
   done < <(
