@@ -17,6 +17,10 @@ PF_STATE="/etc/port-forward.rules"
 SYSCTL_CONF="/etc/sysctl.d/99-port-forward.conf"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
+# 默认安装官方最新版。若客户端不兼容（26.x 的 REALITY 与 Shadowrocket 等），
+# 可临时固定旧版：XRAY_VERSION=1.8.24 bash 本脚本
+XRAY_VERSION="${XRAY_VERSION:-}"
+
 # 临时文件用全局变量，保证 EXIT trap 在函数返回后仍能正确清理
 TMP_INSTALLER=""
 TMP_CONFIG=""
@@ -243,7 +247,15 @@ install_reality() {
   fi
   [[ -s "$installer" ]] || { err "官方安装脚本为空。"; return 1; }
 
-  bash "$installer" install
+  if [[ -n "$XRAY_VERSION" ]]; then
+    dim "安装 Xray-core v$XRAY_VERSION（固定版本，兼容更多客户端）"
+    bash "$installer" install --version "$XRAY_VERSION" || {
+      err "安装 Xray v$XRAY_VERSION 失败。"
+      return 1
+    }
+  else
+    bash "$installer" install || { err "安装 Xray 失败。"; return 1; }
+  fi
   rm -f "$installer"
 
   [[ -x "$XRAY_BIN" ]] || { err "没有找到 Xray 程序：$XRAY_BIN"; return 1; }
@@ -267,7 +279,7 @@ install_reality() {
   [[ -n "$private_key" ]] || { err "REALITY 私钥生成失败。"; return 1; }
   [[ -n "$public_key" ]] || { err "REALITY 公钥生成失败。"; return 1; }
 
-  short_id="$(openssl rand -hex 8)"
+  short_id="$(openssl rand -hex 4)"
   mkdir -p "$(dirname "$CONFIG")"
   tmp_config="$(mktemp --suffix=.json /tmp/xray-config.XXXXXX)"
   TMP_CONFIG="$tmp_config"
@@ -283,7 +295,7 @@ EOF
     if (( enable_socks )); then
       cat <<EOF
     {
-      "listen": "0.0.0.0",
+      "listen": "::",
       "port": $socks_port,
       "protocol": "socks",
       "settings": {
@@ -301,7 +313,7 @@ EOF
     fi
     cat <<EOF
     {
-      "listen": "0.0.0.0",
+      "listen": "::",
       "port": $port,
       "protocol": "vless",
       "settings": {
@@ -324,7 +336,8 @@ EOF
           ],
           "privateKey": "$private_key",
           "shortIds": [
-            "$short_id"
+            "$short_id",
+            ""
           ]
         }
       }
@@ -528,7 +541,7 @@ add_socks5() {
         ((.inbounds // [])
           | map(select((.protocol != "socks") or ($replace == 0))))
         + [{
-            "listen": "0.0.0.0",
+            "listen": "::",
             "port": $port,
             "protocol": "socks",
             "settings": {
