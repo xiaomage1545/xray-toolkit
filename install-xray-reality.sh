@@ -675,7 +675,8 @@ pf_list() {
 }
 
 pf_add() {
-  local lport proto tip tport mode p ans pub
+  local lport proto tip tport mode p ans pub spec
+  local -a f
   local protos=()
 
   if ! command -v iptables >/dev/null 2>&1; then
@@ -687,28 +688,37 @@ pf_add() {
 
   echo
   echo "== 添加端口转发 =="
+  echo "格式：入站端口:目标IP:目标端口"
+  echo "      只填 入站端口:目标端口 表示转到本机；末尾可加 :udp 或 :both（默认 tcp）"
+  echo "      例：443:1.2.3.4:28938     443:28938     8443:1.2.3.4:28938:both"
   echo
 
-  read -rp "对外端口: " lport || return 1
-  [[ "$lport" =~ ^[0-9]+$ ]] || { err "端口必须是数字。"; return 1; }
-  lport="$((10#$lport))"
-  (( lport >= 1 && lport <= 65535 )) || { err "端口范围 1-65535。"; return 1; }
+  read -rp "请输入: " spec || return 1
+  spec="${spec// /}"
+  [[ -n "$spec" ]] || { dim "已取消。"; return 1; }
 
-  read -rp "协议 [tcp/udp/both]（回车=tcp）: " proto || return 1
-  proto="${proto:-tcp}"
+  IFS=':' read -r -a f <<< "$spec"
+  case "${#f[@]}" in
+    2) lport="${f[0]}"; tip="127.0.0.1"; tport="${f[1]}"; proto="tcp" ;;
+    3) lport="${f[0]}"; tip="${f[1]}";    tport="${f[2]}"; proto="tcp" ;;
+    4) lport="${f[0]}"; tip="${f[1]}";    tport="${f[2]}"; proto="${f[3],,}" ;;
+    *) err "格式不对：应为 入站端口:目标IP:目标端口"; return 1 ;;
+  esac
+  [[ -n "$tip" ]] || tip="127.0.0.1"
+
   case "$proto" in
     tcp|udp) protos=("$proto") ;;
     both)    protos=(tcp udp) ;;
-    *)       err "协议只能是 tcp / udp / both。"; return 1 ;;
+    *)       err "协议只能是 tcp / udp / both（默认 tcp）。"; return 1 ;;
   esac
 
-  read -rp "落地服务器 IP（同机转发直接回车）: " tip || return 1
-  tip="${tip:-127.0.0.1}"
+  [[ "$lport" =~ ^[0-9]+$ ]] || { err "入站端口必须是数字。"; return 1; }
+  lport="$((10#$lport))"
+  (( lport >= 1 && lport <= 65535 )) || { err "入站端口范围 1-65535。"; return 1; }
 
-  read -rp "落地服务器上监听的端口: " tport || return 1
-  [[ "$tport" =~ ^[0-9]+$ ]] || { err "端口必须是数字。"; return 1; }
+  [[ "$tport" =~ ^[0-9]+$ ]] || { err "目标端口必须是数字。"; return 1; }
   tport="$((10#$tport))"
-  (( tport >= 1 && tport <= 65535 )) || { err "端口范围 1-65535。"; return 1; }
+  (( tport >= 1 && tport <= 65535 )) || { err "目标端口范围 1-65535。"; return 1; }
 
   if [[ "$tip" == "127.0.0.1" || "$tip" == "localhost" || "$tip" == "::1" ]] ||
      [[ " $(hostname -I 2>/dev/null || true) " == *" $tip "* ]]; then
