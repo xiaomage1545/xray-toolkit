@@ -1108,21 +1108,24 @@ add_tls_ws() {
     [[ "$answer" =~ ^[Yy]$ ]] || { dim "已取消。"; return 1; }
   fi
 
+  echo "可用端口（Cloudflare 也支持的）：443 / 2053 / 2083 / 2087 / 2096 / 8443"
   if port_in_use 443; then
-    caddy_port=8443
-    dim "443 已被占用（多半是 REALITY），Caddy 改用 8443。"
-    dim "若想让 TLS 用 443，请先把 REALITY 换到别的端口再运行本项。"
-  else
-    caddy_port=443
+    dim "提示：443 已被占用（多半是 REALITY），建议选 2053 或 8443。"
   fi
-  read -rp "Caddy 监听端口 [$caddy_port]: " answer || return 1
-  caddy_port="$((10#${answer:-$caddy_port}))"
-  (( caddy_port >= 1 && caddy_port <= 65535 )) || { err "端口不对。"; return 1; }
-  if [[ "$caddy_port" != "443" ]] && port_in_use "$caddy_port"; then
-    err "端口 $caddy_port 已被占用。"
+  read -rp "Caddy 监听端口 [2053]: " answer || return 1
+  answer="${answer// /}"
+  if [[ -z "$answer" ]]; then
+    caddy_port=2053
+  else
+    [[ "$answer" =~ ^[0-9]+$ ]] || { err "端口必须是数字。"; return 1; }
+    caddy_port="$((10#$answer))"
+  fi
+  (( caddy_port >= 1 && caddy_port <= 65535 )) || { err "端口范围 1-65535。"; return 1; }
+  if port_in_use "$caddy_port"; then
+    err "端口 $caddy_port 已被占用，换一个。"
     return 1
   fi
-  [[ "$caddy_port" == "443" ]] || dim "注意：非 443 端口需要安全组单独放行，客户端链接里也要带端口。"
+  [[ "$caddy_port" == "443" ]] || dim "注意：非 443 端口需要在安全组放行，客户端链接里也要带 :$caddy_port"
   port_in_use 80 && dim "注意：80 端口被占用，Let's Encrypt 的 HTTP 验证可能失败。"
 
   if ! command -v caddy >/dev/null 2>&1; then
@@ -1180,7 +1183,11 @@ add_tls_ws() {
   fi
 
   {
-    echo "$domain {"
+    if [[ "$caddy_port" == "443" ]]; then
+      echo "$domain {"
+    else
+      echo "$domain:$caddy_port {"
+    fi
     [[ -n "$email" ]] && echo "    tls $email"
     echo "    encode gzip"
     echo "    handle $ws_path* {"
