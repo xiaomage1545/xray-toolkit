@@ -48,6 +48,14 @@ port_in_use() {
   [[ -n "$(ss -H -ltn "sport = :$1" 2>/dev/null)" ]]
 }
 
+port_used_by_other() {   # 端口被「非 xray」进程占用时返回 0（重装时 xray 自己占着不算冲突）
+  local out
+  out="$(ss -H -ltnp "sport = :$1" 2>/dev/null)"
+  [[ -z "$out" ]] && return 1
+  [[ "$out" == *'"xray"'* ]] && return 1
+  return 0
+}
+
 choose_random_port() {   # [$1=排除的端口]
   local exclude="${1:-}" candidate
   for _ in $(seq 1 500); do
@@ -210,16 +218,18 @@ install_reality() {
   read -rp "监听端口 [443]（回车=443）: " input_port || return 1
   if [[ -z "$input_port" ]]; then
     port=443
-    if port_in_use 443; then
-      err "443 端口已被占用（nginx 等），请重新运行并手动指定端口。"
+    if port_used_by_other 443; then
+      err "443 已被其它程序占用（nginx 等），请重新运行并手动指定端口。"
+      dim "查看占用者：ss -ltnp | grep ':443'"
       return 1
     fi
   else
     [[ "$input_port" =~ ^[0-9]+$ ]] || { err "端口必须是数字。"; return 1; }
     input_port="$((10#$input_port))"
     (( input_port >= 1 && input_port <= 65535 )) || { err "端口范围 1-65535。"; return 1; }
-    if port_in_use "$input_port"; then
-      err "端口 $input_port 已被占用。"
+    if port_used_by_other "$input_port"; then
+      err "端口 $input_port 已被其它程序占用。"
+      dim "查看占用者：ss -ltnp | grep ':$input_port'"
       return 1
     fi
     port="$input_port"
