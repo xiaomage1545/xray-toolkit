@@ -71,9 +71,31 @@ host_for_uri() {
   fi
 }
 
-build_vless_link() {   # host port uuid sni pbk sid flow
-  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&spx=%%2F&type=tcp&flow=%s#Xray-REALITY-%s' \
-    "$3" "$(host_for_uri "$1")" "$2" "$4" "$5" "$6" "${7:-xtls-rprx-vision}" "$2"
+build_vless_link() {   # host port uuid sni pbk sid flow（flow 传 noflow 表示不带该参数）
+  local flow_param="&flow=${7:-xtls-rprx-vision}"
+  [[ "${7:-}" == "noflow" ]] && flow_param=""
+  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&spx=%%2F&type=tcp%s#Xray-REALITY-%s' \
+    "$3" "$(host_for_uri "$1")" "$2" "$4" "$5" "$6" "$flow_param" "$2"
+}
+
+build_vmess_link() {   # host port uuid path
+  local json b64
+  json="$(printf '{"v":"2","ps":"VMess-WS-%s","add":"%s","port":"%s","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"","sni":"","alpn":"","fp":""}' \
+    "$2" "$1" "$2" "$3" "$1" "$4")"
+  b64="$(printf '%s' "$json" | base64 -w0 2>/dev/null || printf '%s' "$json" | base64 | tr -d '\n')"
+  printf 'vmess://%s' "$b64"
+}
+
+build_ss_link() {   # host port method pass
+  local ui
+  ui="$(printf '%s:%s' "$3" "$4" | base64 -w0 2>/dev/null || printf '%s:%s' "$3" "$4" | base64 | tr -d '\n')"
+  printf 'ss://%s@%s:%s#SS-%s' "$ui" "$(host_for_uri "$1")" "$2" "$2"
+}
+
+build_ws_tls_link() {   # host port uuid path
+  local p="${4//\//%2F}"
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#TLS-WS-%s' \
+    "$3" "$1" "$2" "$1" "$1" "$p" "$2"
 }
 
 build_socks_link() {   # host port user pass
@@ -167,11 +189,12 @@ xray_apply() {   # $1=新配置文件
 
 install_reality() {
   local input_port port server_name want_socks enable_socks socks_port socks_user socks_pass
+  local uuid2 vmess_uuid vmess_port vmess_path ss_port ss_method ss_pass ip6 vmess_link ss_link link6 link_novision
   local uuid key_output private_key public_key short_id tmp_config installer server_addr link
 
   echo
   echo "== 安装 / 重新安装：Xray + VLESS + REALITY =="
-  echo "默认端口：随机选择 20000-60000 之间的空闲端口"
+  echo "默认端口：443（REALITY 用 443 最不易被墙）"
   echo
 
   if ! command -v apt-get >/dev/null 2>&1; then
@@ -180,16 +203,21 @@ install_reality() {
   fi
 
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y curl ca-certificates openssl iproute2 coreutils jq
+  apt-get update -y || dim "apt 索引更新失败（多半是系统时间不准），尝试继续…"
+  apt-get install -y curl ca-certificates openssl iproute2 coreutils jq ||
+    dim "依赖安装返回非 0，已装好的可忽略"
 
-  read -rp "监听端口（直接回车随机选择）: " input_port || return 1
+  read -rp "监听端口 [443]（回车=443）: " input_port || return 1
   if [[ -z "$input_port" ]]; then
-    port="$(choose_random_port)" || { err "无法找到空闲端口。"; return 1; }
+    port=443
+    if port_in_use 443; then
+      err "443 端口已被占用（nginx 等），请重新运行并手动指定端口。"
+      return 1
+    fi
   else
     [[ "$input_port" =~ ^[0-9]+$ ]] || { err "端口必须是数字。"; return 1; }
     input_port="$((10#$input_port))"
-    (( input_port >= 1024 && input_port <= 65535 )) || { err "端口范围 1024-65535。"; return 1; }
+    (( input_port >= 1 && input_port <= 65535 )) || { err "端口范围 1-65535。"; return 1; }
     if port_in_use "$input_port"; then
       err "端口 $input_port 已被占用。"
       return 1
@@ -280,6 +308,16 @@ install_reality() {
   [[ -n "$public_key" ]] || { err "REALITY 公钥生成失败。"; return 1; }
 
   short_id="$(openssl rand -hex 4)"
+  uuid2="$("$XRAY_BIN" uuid)"
+  vmess_uuid="$("$XRAY_BIN" uuid)"
+  vmess_port="$(choose_random_port "$port")" || { err "无法找到 VMess 空闲端口。"; return 1; }
+  vmess_path="/$(openssl rand -hex 4)"
+  ss_port="$(choose_random_port "$vmess_port")" || { err "无法找到 Shadowsocks 空闲端口。"; return 1; }
+  while [[ "$ss_port" == "$port" ]]; do
+    ss_port="$(choose_random_port "$vmess_port")" || { err "无法找到 Shadowsocks 空闲端口。"; return 1; }
+  done
+  ss_method="chacha20-ietf-poly1305"
+  ss_pass="$(rand_str 16)"
   mkdir -p "$(dirname "$CONFIG")"
   tmp_config="$(mktemp --suffix=.json /tmp/xray-config.XXXXXX)"
   TMP_CONFIG="$tmp_config"
@@ -314,6 +352,38 @@ EOF
     cat <<EOF
     {
       "listen": "::",
+      "port": $vmess_port,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "$vmess_uuid",
+            "security": "auto"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "$vmess_path"
+        }
+      }
+    },
+    {
+      "listen": "::",
+      "port": $ss_port,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "$ss_method",
+        "password": "$ss_pass",
+        "network": "tcp,udp"
+      }
+    },
+EOF
+    cat <<EOF
+    {
+      "listen": "::",
       "port": $port,
       "protocol": "vless",
       "settings": {
@@ -321,6 +391,9 @@ EOF
           {
             "id": "$uuid",
             "flow": "xtls-rprx-vision"
+          },
+          {
+            "id": "$uuid2"
           }
         ],
         "decryption": "none"
@@ -373,12 +446,25 @@ EOF
   [[ -n "$server_addr" ]] || { err "服务器地址不能为空。"; return 1; }
 
   link="$(build_vless_link "$server_addr" "$port" "$uuid" "$server_name" "$public_key" "$short_id" "xtls-rprx-vision")"
+  link_novision="$(build_vless_link "$server_addr" "$port" "$uuid2" "$server_name" "$public_key" "$short_id" "noflow")"
+  vmess_link="$(build_vmess_link "$server_addr" "$vmess_port" "$vmess_uuid" "$vmess_path")"
+  ss_link="$(build_ss_link "$server_addr" "$ss_port" "$ss_method" "$ss_pass")"
+  ip6="$(curl -6 -fsS --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
+  link6=""
+  [[ -n "$ip6" ]] && link6="$(build_vless_link "$ip6" "$port" "$uuid" "$server_name" "$public_key" "$short_id" "xtls-rprx-vision")"
 
   {
     echo "# Xray links — 生成于 $(date '+%Y-%m-%d %H:%M:%S')"
     echo "# host: $server_addr"
     echo "# REALITY  端口 $port  伪装域名 $server_name"
     echo "$link"
+    echo "# REALITY-无Vision（兼容老客户端） UUID $uuid2"
+    echo "$link_novision"
+    [[ -n "$link6" ]] && { echo "# REALITY-IPv6 $ip6:$port"; echo "$link6"; }
+    echo "# VMess+WS  端口 $vmess_port  路径 $vmess_path"
+    echo "$vmess_link"
+    echo "# Shadowsocks 端口 $ss_port  加密 $ss_method  密码 $ss_pass"
+    echo "$ss_link"
     if (( enable_socks )); then
       echo "# SOCKS5   端口 $socks_port  用户名 $socks_user  密码 $socks_pass"
       build_socks_link "$server_addr" "$socks_port" "$socks_user" "$socks_pass"
@@ -403,6 +489,23 @@ EOF
   echo "链接:"
   echo "$link"
   echo
+  echo "【REALITY · 无 Vision 流控】给不支持 Vision 的客户端用"
+  echo "UUID: $uuid2"
+  echo "$link_novision"
+  echo
+  if [[ -n "$link6" ]]; then
+    echo "【REALITY · IPv6 地址】$ip6"
+    echo "$link6"
+    echo
+  fi
+  echo "【VMess + WebSocket】"
+  echo "端口: $vmess_port/TCP   路径: $vmess_path"
+  echo "$vmess_link"
+  echo
+  echo "【Shadowsocks】"
+  echo "端口: $ss_port   加密: $ss_method   密码: $ss_pass"
+  echo "$ss_link"
+  echo
   if (( enable_socks )); then
     echo "$server_addr:$socks_port:$socks_user:$socks_pass"
     echo "链接: $(build_socks_link "$server_addr" "$socks_port" "$socks_user" "$socks_pass")"
@@ -422,7 +525,7 @@ EOF
 
 show_links() {
   local host="${1:-}" found=0
-  local port uuid flow sni pk sid user pass pbk link
+  local port uuid flow sni pk sid user pass pbk link vmess_id vmess_path ss_alg ss_pw
 
   [[ -f "$CONFIG" ]] || { err "找不到 $CONFIG，请先安装。"; return 1; }
   ensure_jq || return 1
@@ -493,6 +596,38 @@ show_links() {
       | [ (.port | tostring),
           (.settings.accounts[0].user // ""),
           (.settings.accounts[0].pass // "")
+        ] | @tsv' "$CONFIG" 2>/dev/null || true
+  )
+
+  while IFS=$'\t' read -r port vmess_id vmess_path; do
+    [[ -n "$port" ]] || continue
+    found=1
+    echo
+    echo "VMess + WebSocket"
+    echo "端口: $port/TCP   路径: $vmess_path"
+    echo "链接: $(build_vmess_link "$host" "$port" "$vmess_id" "$vmess_path")"
+  done < <(
+    jq -r '.inbounds[]?
+      | select(.protocol == "vmess")
+      | [ (.port | tostring),
+          (.settings.clients[0].id // ""),
+          (.streamSettings.wsSettings.path // "/")
+        ] | @tsv' "$CONFIG" 2>/dev/null || true
+  )
+
+  while IFS=$'\t' read -r port ss_alg ss_pw; do
+    [[ -n "$port" ]] || continue
+    found=1
+    echo
+    echo "Shadowsocks"
+    echo "端口: $port   加密: $ss_alg   密码: $ss_pw"
+    echo "链接: $(build_ss_link "$host" "$port" "$ss_alg" "$ss_pw")"
+  done < <(
+    jq -r '.inbounds[]?
+      | select(.protocol == "shadowsocks")
+      | [ (.port | tostring),
+          (.settings.method // ""),
+          (.settings.password // "")
         ] | @tsv' "$CONFIG" 2>/dev/null || true
   )
 
@@ -945,6 +1080,144 @@ install_shortcuts() {   # 写成真实的小包装脚本，不依赖本文件的
 
 # ============ 主菜单 ============
 
+add_tls_ws() {
+  local domain email answer caddy_port ws_port ws_uuid ws_path ip4 pub new_config link
+  local caddyfile=/etc/caddy/Caddyfile
+
+  echo
+  echo "== 添加 域名 + TLS 入口（VLESS + WebSocket + TLS）=="
+  echo "需要一个已解析到本机的域名，Caddy 会自动申请 Let's Encrypt 证书"
+  echo
+
+  read -rp "域名（如 node.example.com）: " domain || return 1
+  domain="${domain// /}"
+  [[ "$domain" =~ ^[A-Za-z0-9.-]+$ && "$domain" == *.* ]] || { err "域名格式不对。"; return 1; }
+
+  read -rp "邮箱（证书到期提醒，可留空回车）: " email || return 1
+
+  pub="$(get_public_ip)"
+  ip4="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}')"
+  if [[ -z "$ip4" ]]; then
+    err "解析不到 $domain 的 A 记录。"
+    dim "请先把 $domain 的 A 记录指向 $pub，等生效后再试。"
+    return 1
+  fi
+  if [[ -n "$pub" && "$ip4" != "$pub" ]]; then
+    err "域名解析到 $ip4，本机公网 IP 是 $pub。"
+    read -rp "仍要继续（证书可能签发失败）？[y/N]: " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || { dim "已取消。"; return 1; }
+  fi
+
+  if port_in_use 443; then
+    caddy_port=8443
+    dim "443 已被占用（多半是 REALITY），Caddy 改用 8443。"
+    dim "若想让 TLS 用 443，请先把 REALITY 换到别的端口再运行本项。"
+  else
+    caddy_port=443
+  fi
+  read -rp "Caddy 监听端口 [$caddy_port]: " answer || return 1
+  caddy_port="$((10#${answer:-$caddy_port}))"
+  (( caddy_port >= 1 && caddy_port <= 65535 )) || { err "端口不对。"; return 1; }
+  if [[ "$caddy_port" != "443" ]] && port_in_use "$caddy_port"; then
+    err "端口 $caddy_port 已被占用。"
+    return 1
+  fi
+  [[ "$caddy_port" == "443" ]] || dim "注意：非 443 端口需要安全组单独放行，客户端链接里也要带端口。"
+  port_in_use 80 && dim "注意：80 端口被占用，Let's Encrypt 的 HTTP 验证可能失败。"
+
+  if ! command -v caddy >/dev/null 2>&1; then
+    echo "正在安装 Caddy（首次需要 1~2 分钟）..."
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg >/dev/null 2>&1 || true
+    if ! curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key 2>/dev/null |
+         gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null; then
+      err "下载 Caddy 签名密钥失败（网络问题）。"
+      return 1
+    fi
+    if ! curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null; then
+      err "写入 Caddy apt 源失败。"
+      return 1
+    fi
+    apt-get update -y >/dev/null 2>&1 || dim "apt 索引更新失败，继续尝试…"
+    if ! apt-get install -y caddy >/dev/null 2>&1; then
+      err "安装 Caddy 失败。"
+      return 1
+    fi
+  fi
+  command -v caddy >/dev/null 2>&1 || { err "Caddy 未安装成功。"; return 1; }
+
+  ws_port="$(choose_random_port)" || { err "无法找到本地空闲端口。"; return 1; }
+  ws_uuid="$("$XRAY_BIN" uuid)"
+  ws_path="/ws"
+
+  new_config="$(mktemp --suffix=.json /tmp/xray-tls.XXXXXX)"
+  if ! jq --argjson port "$ws_port" --arg uuid "$ws_uuid" --arg path "$ws_path" '
+    .inbounds = ((.inbounds // []) + [{
+      "listen": "127.0.0.1",
+      "port": $port,
+      "protocol": "vless",
+      "settings": { "clients": [ { "id": $uuid } ], "decryption": "none" },
+      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": $path } }
+    }])
+  ' "$CONFIG" > "$new_config"; then
+    err "生成新配置失败。"
+    return 1
+  fi
+  if ! "$XRAY_BIN" run -test -config "$new_config" >/dev/null 2>&1; then
+    err "新配置校验失败，已中止（原配置未改动）。"
+    return 1
+  fi
+
+  cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+  install -o root -g root -m 644 "$new_config" "$CONFIG"
+  if ! systemctl restart xray; then
+    err "xray 重启失败，请查看 journalctl -u xray -n 40"
+    return 1
+  fi
+
+  mkdir -p /var/www/xray-tls
+  if [[ ! -f /var/www/xray-tls/index.html ]]; then
+    printf '<!doctype html><meta charset="utf-8"><title>Welcome</title><h1>It works!</h1>\n' > /var/www/xray-tls/index.html
+  fi
+
+  {
+    echo "$domain {"
+    [[ -n "$email" ]] && echo "    tls $email"
+    echo "    encode gzip"
+    echo "    handle $ws_path* {"
+    echo "        reverse_proxy 127.0.0.1:$ws_port"
+    echo "    }"
+    echo "    handle {"
+    echo "        root * /var/www/xray-tls"
+    echo "        file_server"
+    echo "    }"
+    echo "}"
+  } > "$caddyfile"
+
+  systemctl enable caddy >/dev/null 2>&1 || true
+  if ! systemctl restart caddy; then
+    err "caddy 启动失败，查看：journalctl -u caddy -n 40"
+    return 1
+  fi
+  sleep 3
+
+  link="$(build_ws_tls_link "$domain" "$caddy_port" "$ws_uuid" "$ws_path")"
+
+  echo
+  hr
+  ok "TLS 入口已配置（证书签发需要 1~3 分钟）"
+  hr
+  echo "域名: $domain"
+  echo "端口: $caddy_port"
+  echo "UUID: $ws_uuid"
+  echo "路径: $ws_path"
+  echo "链接:"
+  echo "$link"
+  echo
+  dim "看证书进度：curl -I https://$domain:$caddy_port"
+  dim "Caddy 日志：journalctl -u caddy -n 50 --no-pager"
+  dim "客户端节点名建议用域名本身，端口 $caddy_port，传输 ws，TLS 开启，路径 $ws_path"
+}
+
 show_main_menu() {
   local st rp
   st="$(systemctl is-active xray 2>/dev/null || echo unknown)"
@@ -961,8 +1234,9 @@ show_main_menu() {
   echo "  2) 查看已有链接"
   echo "  3) 追加 SOCKS5（不动现有 REALITY）"
   echo "  4) 端口转发管理"
-  echo "  5) 查看服务状态与日志"
-  echo "  6) 退出"
+  echo "  5) 添加 域名+TLS 入口（VLESS+WS+TLS，Caddy 自动签证书）"
+  echo "  6) 查看服务状态与日志"
+  echo "  7) 退出"
   hr
 }
 
@@ -972,14 +1246,15 @@ main_menu() {
   install_shortcuts >/dev/null 2>&1 || true
   while true; do
     show_main_menu
-    if ! read -rp "请选择 [1-6]: " c; then echo; break; fi
+    if ! read -rp "请选择 [1-7]: " c; then echo; break; fi
     case "$c" in
       1) install_reality; pause_key ;;
       2) show_links; pause_key ;;
       3) add_socks5; pause_key ;;
       4) fwd_menu ;;
-      5) show_status; pause_key ;;
-      6|q|Q|exit) break ;;
+      5) add_tls_ws; pause_key ;;
+      6) show_status; pause_key ;;
+      7|q|Q|exit) break ;;
       "") ;;
       *) err "无效选项：$c" ;;
     esac
