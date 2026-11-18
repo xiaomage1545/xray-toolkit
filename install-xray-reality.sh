@@ -100,6 +100,14 @@ build_ss_link() {   # host port method pass
   printf 'ss://%s@%s:%s#SS-%s' "$ui" "$(host_for_uri "$1")" "$2" "$2"
 }
 
+build_vmess_link_tls() {   # host port uuid path（vmess over ws + tls）
+  local json b64
+  json="$(printf '{"v":"2","ps":"RELAY-WS-%s","add":"%s","port":"%s","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","alpn":"","fp":""}' \
+    "$2" "$1" "$2" "$3" "$1" "$4" "$1")"
+  b64="$(printf '%s' "$json" | base64 -w0 2>/dev/null || printf '%s' "$json" | base64 | tr -d '\n')"
+  printf 'vmess://%s' "$b64"
+}
+
 build_ws_tls_link() {   # host port uuid path
   local p="${4//\//%2F}"
   printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#TLS-WS-%s' \
@@ -1250,6 +1258,344 @@ add_tls_ws() {
   dim "客户端节点名建议用域名本身，端口 $caddy_port，传输 ws，TLS 开启，路径 $ws_path"
 }
 
+add_chain_relay() {
+  local raw proto json b64 body userinfo rest hostport query host="" port="" net="" rtls=""
+  local uuid="" sni="" pbk="" sid="" flow="" spx="" rpath="" method="" spass="" suser=""
+  local domain caddy_port local_path auto_path answer kind
+  local wsin_port wuuid tag_in tag_out inb outb cfg backup link
+  local CHAIN_DB=/etc/xray-chain.tsv
+
+  cfg=/usr/local/etc/xray/config.json
+  echo
+  echo "== 添加落地链（客户端统一从 2053 进，xray 转发到落地）=="
+  echo "支持：VLESS+REALITY、VLESS+WS(-TLS)、VMess+WS、Shadowsocks、SOCKS5"
+  echo
+
+  read -rp "粘贴落地节点链接: " raw || return 1
+  raw="${raw// /}"
+  [[ -n "$raw" ]] || { dim "已取消。"; return 1; }
+
+  case "$raw" in
+    vless://*)
+      kind=vless
+      body="${raw#vless://}"; body="${body%%#*}"
+      userinfo="${body%%@*}"; rest="${body#*@}"
+      hostport="${rest%%\?*}"; query=""
+      [[ "$rest" == *\?* ]] && query="&${rest#*\?}"
+      uuid="$userinfo"
+      host="${hostport%:*}"; port="${hostport##*:}"
+      net="$(sed -nE 's/.*&type=([^&]*).*/\1/p' <<<"$query")"
+      rtls="$(sed -nE 's/.*&security=([^&]*).*/\1/p' <<<"$query")"
+      sni="$(sed -nE 's/.*&sni=([^&]*).*/\1/p' <<<"$query")"
+      pbk="$(sed -nE 's/.*&pbk=([^&]*).*/\1/p' <<<"$query")"
+      sid="$(sed -nE 's/.*&sid=([^&]*).*/\1/p' <<<"$query")"
+      flow="$(sed -nE 's/.*&flow=([^&]*).*/\1/p' <<<"$query")"
+      spx="$(sed -nE 's/.*&spx=([^&]*).*/\1/p' <<<"$query")"
+      rpath="$(sed -nE 's/.*&path=([^&]*).*/\1/p' <<<"$query")"
+      rpath="${rpath//%2F//}"
+      spx="${spx//%2F//}"
+      ;;
+    vmess://*)
+      kind=vmess
+      b64="${raw#vmess://}"; b64="${b64%%#*}"
+      while (( ${#b64} % 4 )); do b64="${b64}="; done
+      json="$(printf '%s' "$b64" | tr '_-' '/+' | base64 -d 2>/dev/null || true)"
+      [[ -n "$json" ]] || { err "VMess 链接解码失败。"; return 1; }
+      host="$(jq -r '.add // empty' <<<"$json")"
+      port="$(jq -r '.port // empty' <<<"$json")"
+      uuid="$(jq -r '.id // empty' <<<"$json")"
+      net="$(jq -r '.net // ""' <<<"$json")"
+      rtls="$(jq -r '.tls // ""' <<<"$json")"
+      rpath="$(jq -r '.path // "/"' <<<"$json")"
+      ;;
+    ss://*)
+      kind=ss
+      [[ "$raw" == *"@"* ]] || { err "SS 链接是老格式，请换 SIP002（ss://base64@host:port#tag）。"; return 1; }
+      rest="${raw#ss://}"; rest="${rest%%#*}"
+      userinfo="${rest%%@*}"; hostport="${rest#*@}"
+      host="${hostport%:*}"; port="${hostport##*:}"
+      b64="$userinfo"
+      while (( ${#b64} % 4 )); do b64="${b64}="; done
+      dec="$(printf '%s' "$b64" | tr '_-' '/+' | base64 -d 2>/dev/null || true)"
+      method="${dec%%:*}"; spass="${dec#*:}"
+      [[ -n "$method" && -n "$spass" ]] || { err "SS 账号解析失败。"; return 1; }
+      ;;
+    *)
+      if [[ "$raw" =~ ^[A-Za-z0-9.-]+:[0-9]+:[^:]+:[^:]+$ ]]; then
+        kind=socks
+        IFS=':' read -r host port suser spass <<<"$raw"
+      else
+        err "无法识别：支持 vless://、vmess://、ss://，或 host:port:user:pass"
+        return 1
+      fi
+      ;;
+  esac
+
+  if [[ ! "$host" =~ ^[A-Za-z0-9.-]+$ || ! "$port" =~ ^[0-9]+$ ]]; then
+    err "解析落地地址失败：host=${host:-空} port=${port:-空}"
+    return 1
+  fi
+
+  if [[ ! -f /etc/caddy/Caddyfile ]]; then
+    err "没有 Caddyfile，请先运行菜单 5。"
+    return 1
+  fi
+  domain="$(awk '/^[A-Za-z0-9.-]+(:[0-9]+)?[[:space:]]*\{/{split($1,a,":"); print a[1]; exit}' /etc/caddy/Caddyfile)"
+  caddy_port="$(awk '/^[A-Za-z0-9.-]+:[0-9]+[[:space:]]*\{/{split($1,a,":"); print a[2]; exit}' /etc/caddy/Caddyfile)"
+  caddy_port="${caddy_port:-443}"
+  [[ -n "$domain" ]] || { err "没能从 Caddyfile 读出域名。"; return 1; }
+
+  wsin_port="$(choose_random_port)" || { err "找不到本地空闲端口。"; return 1; }
+  wuuid="$("$XRAY_BIN" uuid)"
+  tag_in="chainin-$wsin_port"
+  tag_out="chainout-$wsin_port"
+
+  auto_path="/$(openssl rand -hex 4)"
+  while grep -qF "handle ${auto_path}* {" /etc/caddy/Caddyfile 2>/dev/null; do
+    auto_path="/$(openssl rand -hex 4)"
+  done
+  read -rp "本机路径 [$auto_path]（回车用随机）: " answer || return 1
+  local_path="${answer// /}"
+  local_path="${local_path:-$auto_path}"
+  [[ "$local_path" == /* ]] || local_path="/$local_path"
+  if grep -qF "handle ${local_path}* {" /etc/caddy/Caddyfile 2>/dev/null; then
+    err "路径 $local_path 已存在。"
+    return 1
+  fi
+
+  inb="$(jq -n --arg tag "$tag_in" --arg uuid "$wuuid" --argjson port "$wsin_port" --arg path "$local_path" '{
+    listen: "127.0.0.1", port: $port, protocol: "vless", tag: $tag,
+    settings: { clients: [ { id: $uuid } ], decryption: "none" },
+    streamSettings: { network: "ws", security: "none", wsSettings: { path: $path } }
+  }')" || { err "构造入站失败。"; return 1; }
+
+  case "$kind" in
+    vless)
+      if [[ "$rtls" == "reality" ]]; then
+        outb="$(jq -n --arg tag "$tag_out" --arg a "$host" --argjson p "$port" --arg id "$uuid" \
+          --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg spx "$spx" '{
+          tag: $tag, protocol: "vless",
+          settings: { vnext: [ { address: $a, port: $p, users: [ { id: $id, encryption: "none", flow: $flow } ] } ] },
+          streamSettings: { network: "tcp", security: "reality",
+            realitySettings: { serverName: $sni, fingerprint: "chrome", publicKey: $pbk, shortId: $sid, spiderX: $spx } }
+        }')"
+      else
+        local sec=tls
+        [[ -z "$rtls" || "$rtls" == "none" ]] && sec=none
+        outb="$(jq -n --arg tag "$tag_out" --arg a "$host" --argjson p "$port" --arg id "$uuid" \
+          --arg sni "$sni" --arg path "$rpath" --arg sec "$sec" --arg hosth "$host" '{
+          tag: $tag, protocol: "vless",
+          settings: { vnext: [ { address: $a, port: $p, users: [ { id: $id, encryption: "none" } ] } ] },
+          streamSettings: { network: "ws", security: $sec,
+            tlsSettings: { serverName: $sni, fingerprint: "chrome" },
+            wsSettings: { path: $path, headers: { Host: $hosth } } }
+        }')"
+      fi
+      ;;
+    vmess)
+      local sec=vnone
+      [[ "$rtls" == "tls" ]] && sec=tls
+      outb="$(jq -n --arg tag "$tag_out" --arg a "$host" --argjson p "$port" --arg id "$uuid" \
+        --arg path "$rpath" --arg sec "$sec" --arg hosth "$host" '{
+        tag: $tag, protocol: "vmess",
+        settings: { vnext: [ { address: $a, port: $p, users: [ { id: $id, security: "auto" } ] } ] },
+        streamSettings: { network: "ws", security: $sec,
+          wsSettings: { path: $path, headers: { Host: $hosth } } }
+      }')"
+      ;;
+    ss)
+      outb="$(jq -n --arg tag "$tag_out" --arg a "$host" --argjson p "$port" --arg m "$method" --arg pw "$spass" '{
+        tag: $tag, protocol: "shadowsocks",
+        settings: { servers: [ { address: $a, port: $p, method: $m, password: $pw } ] }
+      }')"
+      ;;
+    socks)
+      outb="$(jq -n --arg tag "$tag_out" --arg a "$host" --argjson p "$port" --arg u "$suser" --arg pw "$spass" '{
+        tag: $tag, protocol: "socks",
+        settings: { servers: [ { address: $a, port: $p, users: [ { user: $u, pass: $pw } ] } ] }
+      }')"
+      ;;
+  esac
+  [[ -n "$outb" ]] || { err "构造出站失败。"; return 1; }
+
+  backup="/root/cfg.bak.$(date +%s)"
+  cp -a "$cfg" "$backup"
+  if ! jq --argjson inb "$inb" --argjson outb "$outb" --arg tin "$tag_in" --arg tout "$tag_out" '
+      .inbounds = ((.inbounds // []) + [$inb])
+      | .outbounds = ((.outbounds // []) + [$outb])
+      | .routing = ((.routing // {}) + { rules: (((.routing.rules) // []) + [ { type: "field", inboundTag: [$tin], outboundTag: $tout } ]) })
+    ' "$cfg" > /tmp/xray-chain.json; then
+    err "写入配置失败。"
+    return 1
+  fi
+  if ! "$XRAY_BIN" run -test -config /tmp/xray-chain.json >/dev/null 2>&1; then
+    err "配置校验失败（落地参数可能不对），已中止。"
+    return 1
+  fi
+  install -o root -g root -m 644 /tmp/xray-chain.json "$cfg"
+  if ! systemctl restart xray >/dev/null 2>&1; then
+    err "xray 重启失败，已回滚。"
+    cp -a "$backup" "$cfg"; systemctl restart xray >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  blk="$(mktemp /tmp/caddy-blk.XXXXXX)"
+  {
+    echo "    handle ${local_path}* {"
+    echo "        reverse_proxy 127.0.0.1:$wsin_port"
+    echo "    }"
+  } > "$blk"
+  cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%s)"
+  newfile="$(mktemp /tmp/caddy-new.XXXXXX)"
+  awk -v blk="$blk" '{ if ($0 ~ /^    handle \{$/ && !done) { while ((getline line < blk) > 0) print line; close(blk); done=1 } print }' /etc/caddy/Caddyfile > "$newfile"
+  install -o root -g root -m 644 "$newfile" /etc/caddy/Caddyfile
+  if ! caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 || ! systemctl reload caddy; then
+    err "Caddy 更新失败，配置已回滚。"
+    cp -a "$backup" "$cfg"; systemctl restart xray >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  link="$(build_ws_tls_link "$domain" "$caddy_port" "$wuuid" "$local_path")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$local_path" "$tag_in" "$tag_out" "$kind" "$host:$port" "$wuuid" "$(date '+%F %T')" >> "$CHAIN_DB"
+  {
+    echo "# $(date '+%Y-%m-%d %H:%M:%S')  $domain:$caddy_port$local_path  ->  $kind://$host:$port"
+    echo "$link"
+  } >> /root/relay-links.txt
+
+  echo
+  hr
+  ok "落地链已生效（客户端走 2053，xray 转发到落地）"
+  hr
+  echo "入口路径: $local_path"
+  echo "落地    : $kind  $host:$port"
+  echo "本地入站: 127.0.0.1:$wsin_port"
+  echo
+  echo "可直接使用的链接:"
+  echo "$link"
+  echo
+  dim "备份: $backup"
+  dim "删除请用菜单 6 → 3（会同时清理 xray 和 Caddy）"
+}
+
+relay_list() {
+  local CHAIN_DB=/etc/xray-chain.tsv domain caddy_port
+  domain="$(awk '/^[A-Za-z0-9.-]+(:[0-9]+)?[[:space:]]*\{/{split($1,a,":"); print a[1]; exit}' /etc/caddy/Caddyfile 2>/dev/null)"
+  caddy_port="$(awk '/^[A-Za-z0-9.-]+:[0-9]+[[:space:]]*\{/{split($1,a,":"); print a[2]; exit}' /etc/caddy/Caddyfile 2>/dev/null)"
+  caddy_port="${caddy_port:-443}"
+
+  if [[ ! -s "$CHAIN_DB" ]]; then
+    dim "还没有任何落地链。"
+    return 0
+  fi
+
+  local i=0 p tin tout kind target uuid ts
+  echo
+  echo "已配置的落地链（入口 $domain:$caddy_port）："
+  while IFS=$'\t' read -r p tin tout kind target uuid ts; do
+    [[ -n "$p" ]] || continue
+    i=$((i + 1))
+    echo
+    printf '  %d) %s  ->  %s %s   %s\n' "$i" "$p" "$kind" "$target" "$ts"
+    printf '     %s\n' "$(build_ws_tls_link "$domain" "$caddy_port" "$uuid" "$p")"
+  done < "$CHAIN_DB"
+  echo
+}
+
+relay_del() {
+  local CHAIN_DB=/etc/xray-chain.tsv cfg=/usr/local/etc/xray/config.json
+  local p n i=0 target tin tout backup newfile
+
+  if [[ ! -s "$CHAIN_DB" ]]; then
+    dim "没有可删除的落地链。"
+    return 0
+  fi
+
+  local -a paths=()
+  while IFS=$'\t' read -r p _; do
+    [[ -n "$p" ]] && paths+=("$p")
+  done < "$CHAIN_DB"
+
+  echo
+  echo "现有落地链："
+  for p in "${paths[@]}"; do
+    i=$((i + 1))
+    printf '  %d) %s\n' "$i" "$p"
+  done
+
+  read -rp "删除第几条（回车取消）: " n || return 1
+  [[ -n "$n" ]] || { dim "已取消。"; return 0; }
+  [[ "$n" =~ ^[0-9]+$ ]] || { err "编号必须是数字。"; return 1; }
+  n="$((10#$n))"
+  if (( n < 1 || n > ${#paths[@]} )); then
+    err "编号超出范围。"
+    return 1
+  fi
+  target="${paths[$((n - 1))]}"
+  tin="$(awk -v p="$target" -F'\t' '$1 == p { print $2; exit }' "$CHAIN_DB")"
+  tout="$(awk -v p="$target" -F'\t' '$1 == p { print $3; exit }' "$CHAIN_DB")"
+
+  backup="/etc/caddy/Caddyfile.bak.$(date +%s)"
+  cp -a /etc/caddy/Caddyfile "$backup"
+  newfile="$(mktemp /tmp/caddy-del.XXXXXX)"
+  awk -v p="$target" '
+    $0 == "    handle " p "* {" { skip = 1 }
+    skip { if ($0 == "    }") { skip = 0 } next }
+    { print }
+  ' /etc/caddy/Caddyfile > "$newfile"
+  if grep -qF "handle ${target}* {" "$newfile"; then
+    err "删除 Caddy 块失败。"
+    return 1
+  fi
+  install -o root -g root -m 644 "$newfile" /etc/caddy/Caddyfile
+  if ! caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    err "Caddyfile 校验失败，已回滚。"
+    cp -a "$backup" /etc/caddy/Caddyfile
+    return 1
+  fi
+  systemctl reload caddy >/dev/null 2>&1 || err "caddy reload 失败，请手动检查。"
+
+  cp -a "$cfg" "$cfg.bak.$(date +%s)"
+  if jq --arg tin "$tin" --arg tout "$tout" '
+      .inbounds = [ (.inbounds // [])[] | select((.tag // "") != $tin) ]
+      | .outbounds = [ (.outbounds // [])[] | select((.tag // "") != $tout) ]
+      | if .routing and .routing.rules then
+          .routing.rules = [ .routing.rules[] | select(((.inboundTag // []) | index($tin)) == null) ]
+        else . end
+    ' "$cfg" > /tmp/xray-del.json && "$XRAY_BIN" run -test -config /tmp/xray-del.json >/dev/null 2>&1; then
+    install -o root -g root -m 644 /tmp/xray-del.json "$cfg"
+    systemctl restart xray >/dev/null 2>&1 || true
+  else
+    err "清理 xray 配置失败（Caddy 已删）。"
+  fi
+
+  awk -v p="$target" -F'\t' '$1 != p' "$CHAIN_DB" > "${CHAIN_DB}.tmp" && mv "${CHAIN_DB}.tmp" "$CHAIN_DB"
+  ok "已删除 $target（Caddy 备份 $backup）"
+}
+
+relay_menu() {
+  local c
+  while true; do
+    echo
+    hr
+    echo "            路径中转管理"
+    hr
+    echo "  1) 添加落地链（所有协议，客户端统一走 2053）"
+    echo "  2) 查看已配置（含可用链接）"
+    echo "  3) 删除某条"
+    echo "  0) 返回主菜单"
+    hr
+    if ! read -rp "请选择 [0-3]: " c; then return 0; fi
+    case "$c" in
+      1) add_chain_relay; pause_key ;;
+      2) relay_list; pause_key ;;
+      3) relay_del; pause_key ;;
+      0|q|Q|back|b) return 0 ;;
+      "") ;;
+      *) err "无效选项：$c" ;;
+    esac
+  done
+}
+
 show_main_menu() {
   local st rp
   st="$(systemctl is-active xray 2>/dev/null || echo unknown)"
@@ -1267,8 +1613,9 @@ show_main_menu() {
   echo "  3) 追加 SOCKS5（不动现有 REALITY）"
   echo "  4) 端口转发管理"
   echo "  5) 添加 域名+TLS 入口（VLESS+WS+TLS，Caddy 自动签证书）"
-  echo "  6) 查看服务状态与日志"
-  echo "  7) 退出"
+  echo "  6) 路径中转管理（添加 / 查看 / 删除，路径随机生成）"
+  echo "  7) 查看服务状态与日志"
+  echo "  8) 退出"
   hr
 }
 
@@ -1278,15 +1625,16 @@ main_menu() {
   install_shortcuts >/dev/null 2>&1 || true
   while true; do
     show_main_menu
-    if ! read -rp "请选择 [1-7]: " c; then echo; break; fi
+    if ! read -rp "请选择 [1-8]: " c; then echo; break; fi
     case "$c" in
       1) install_reality; pause_key ;;
       2) show_links; pause_key ;;
       3) add_socks5; pause_key ;;
       4) fwd_menu ;;
       5) add_tls_ws; pause_key ;;
-      6) show_status; pause_key ;;
-      7|q|Q|exit) break ;;
+      6) relay_menu ;;
+      7) show_status; pause_key ;;
+      8|q|Q|exit) break ;;
       "") ;;
       *) err "无效选项：$c" ;;
     esac
