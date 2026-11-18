@@ -108,10 +108,11 @@ build_vmess_link_tls() {   # host port uuid path（vmess over ws + tls）
   printf 'vmess://%s' "$b64"
 }
 
-build_ws_tls_link() {   # host port uuid path
+build_ws_tls_link() {   # host port uuid path [备注]
   local p="${4//\//%2F}"
-  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#TLS-WS-%s' \
-    "$3" "$1" "$2" "$1" "$1" "$p" "$2"
+  local tag="${5:-TLS-WS-$2}"
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s' \
+    "$3" "$1" "$2" "$1" "$1" "$p" "$tag"
 }
 
 build_socks_link() {   # host port user pass
@@ -1455,8 +1456,16 @@ add_chain_relay() {
     return 1
   fi
 
-  link="$(build_ws_tls_link "$domain" "$caddy_port" "$wuuid" "$local_path")"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$local_path" "$tag_in" "$tag_out" "$kind" "$host:$port" "$wuuid" "$(date '+%F %T')" >> "$CHAIN_DB"
+  local kindlabel mark
+  case "$kind" in
+    vless) if [[ "$rtls" == "reality" ]]; then kindlabel=REALITY; else kindlabel=VLESS; fi ;;
+    vmess) kindlabel=VMess ;;
+    ss) kindlabel=SS ;;
+    *) kindlabel=SOCKS5 ;;
+  esac
+  mark="中转-${kindlabel}-${host}:${port}"
+  link="$(build_ws_tls_link "$domain" "$caddy_port" "$wuuid" "$local_path" "$mark")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$local_path" "$tag_in" "$tag_out" "$kindlabel" "$host:$port" "$wuuid" "$(date '+%F %T')" >> "$CHAIN_DB"
   {
     echo "# $(date '+%Y-%m-%d %H:%M:%S')  $domain:$caddy_port$local_path  ->  $kind://$host:$port"
     echo "$link"
@@ -1467,7 +1476,7 @@ add_chain_relay() {
   ok "落地链已生效（客户端走 2053，xray 转发到落地）"
   hr
   echo "入口路径: $local_path"
-  echo "落地    : $kind  $host:$port"
+  echo "落地    : $kindlabel  $host:$port"
   echo "本地入站: 127.0.0.1:$wsin_port"
   echo
   echo "可直接使用的链接:"
@@ -1495,8 +1504,10 @@ relay_list() {
     [[ -n "$p" ]] || continue
     i=$((i + 1))
     echo
+    local mark
+    mark="中转-${kind}-${target}"
     printf '  %d) %s  ->  %s %s   %s\n' "$i" "$p" "$kind" "$target" "$ts"
-    printf '     %s\n' "$(build_ws_tls_link "$domain" "$caddy_port" "$uuid" "$p")"
+    printf '     %s\n' "$(build_ws_tls_link "$domain" "$caddy_port" "$uuid" "$p" "$mark")"
   done < "$CHAIN_DB"
   echo
 }
