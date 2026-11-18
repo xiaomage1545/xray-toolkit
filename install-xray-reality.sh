@@ -197,7 +197,7 @@ xray_apply() {   # $1=新配置文件
 
 install_reality() {
   local input_port port server_name want_socks enable_socks socks_port socks_user socks_pass
-  local uuid2 vmess_uuid vmess_port vmess_path ss_port ss_method ss_pass ip6 vmess_link ss_link link6 link_novision
+  local vmess_uuid vmess_port vmess_path ss_port ss_method ss_pass ip6 vmess_link ss_link link6
   local uuid key_output private_key public_key short_id tmp_config installer server_addr link
 
   echo
@@ -318,7 +318,6 @@ install_reality() {
   [[ -n "$public_key" ]] || { err "REALITY 公钥生成失败。"; return 1; }
 
   short_id="$(openssl rand -hex 4)"
-  uuid2="$("$XRAY_BIN" uuid)"
   vmess_uuid="$("$XRAY_BIN" uuid)"
   vmess_port="$(choose_random_port "$port")" || { err "无法找到 VMess 空闲端口。"; return 1; }
   vmess_path="/$(openssl rand -hex 4)"
@@ -401,9 +400,6 @@ EOF
           {
             "id": "$uuid",
             "flow": "xtls-rprx-vision"
-          },
-          {
-            "id": "$uuid2"
           }
         ],
         "decryption": "none"
@@ -456,7 +452,6 @@ EOF
   [[ -n "$server_addr" ]] || { err "服务器地址不能为空。"; return 1; }
 
   link="$(build_vless_link "$server_addr" "$port" "$uuid" "$server_name" "$public_key" "$short_id" "xtls-rprx-vision")"
-  link_novision="$(build_vless_link "$server_addr" "$port" "$uuid2" "$server_name" "$public_key" "$short_id" "noflow")"
   vmess_link="$(build_vmess_link "$server_addr" "$vmess_port" "$vmess_uuid" "$vmess_path")"
   ss_link="$(build_ss_link "$server_addr" "$ss_port" "$ss_method" "$ss_pass")"
   ip6="$(curl -6 -fsS --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
@@ -468,8 +463,6 @@ EOF
     echo "# host: $server_addr"
     echo "# REALITY  端口 $port  伪装域名 $server_name"
     echo "$link"
-    echo "# REALITY-无Vision（兼容老客户端） UUID $uuid2"
-    echo "$link_novision"
     [[ -n "$link6" ]] && { echo "# REALITY-IPv6 $ip6:$port"; echo "$link6"; }
     echo "# VMess+WS  端口 $vmess_port  路径 $vmess_path"
     echo "$vmess_link"
@@ -498,10 +491,6 @@ EOF
   echo "Short ID: $short_id"
   echo "链接:"
   echo "$link"
-  echo
-  echo "【REALITY · 无 Vision 流控】给不支持 Vision 的客户端用"
-  echo "UUID: $uuid2"
-  echo "$link_novision"
   echo
   if [[ -n "$link6" ]]; then
     echo "【REALITY · IPv6 地址】$ip6"
@@ -640,6 +629,32 @@ show_links() {
           (.settings.password // "")
         ] | @tsv' "$CONFIG" 2>/dev/null || true
   )
+
+  if [[ -f /etc/caddy/Caddyfile ]]; then
+    local tls_site tls_host tls_port wport wuuid wpath
+    tls_site="$(awk '/^[A-Za-z0-9.-]+(:[0-9]+)?[[:space:]]*\{/{print $1; exit}' /etc/caddy/Caddyfile 2>/dev/null)"
+    if [[ -n "$tls_site" ]]; then
+      tls_host="${tls_site%%:*}"
+      tls_port="${tls_site##*:}"
+      [[ "$tls_port" == "$tls_host" ]] && tls_port=443
+      while IFS=$'\t' read -r wport wuuid wpath; do
+        [[ -n "$wport" ]] || continue
+        found=1
+        echo
+        echo "VLESS + WS + TLS"
+        echo "地址: $tls_host:$tls_port   路径: $wpath"
+        echo "UUID: $wuuid"
+        echo "链接: $(build_ws_tls_link "$tls_host" "$tls_port" "$wuuid" "$wpath")"
+      done < <(
+        jq -r '.inbounds[]?
+          | select(.protocol == "vless" and (.streamSettings.network // "") == "ws")
+          | [ (.port | tostring),
+              (.settings.clients[0].id // ""),
+              (.streamSettings.wsSettings.path // "/ws")
+            ] | @tsv' "$CONFIG" 2>/dev/null || true
+      )
+    fi
+  fi
 
   if (( found == 0 )); then
     echo
