@@ -1116,6 +1116,7 @@ install_shortcuts() {   # 写成真实的小包装脚本，不依赖本文件的
 
 add_tls_ws() {
   local domain email answer caddy_port ws_port ws_uuid ws_path ip4 pub new_config link
+  local cert_mode pem key
   local caddyfile=/etc/caddy/Caddyfile
 
   echo
@@ -1129,12 +1130,31 @@ add_tls_ws() {
 
   read -rp "邮箱（证书到期提醒，可留空回车）: " email || return 1
 
-  pub="$(get_public_ip)"
-  ip4="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}')"
+  echo "证书方式：1) Let's Encrypt 自动（需要 80 端口）  2) 使用已有证书文件（Cloudflare Origin Certificate）"
+  read -rp "选择 [1]: " cert_mode || return 1
+  cert_mode="${cert_mode:-1}"
+  if [[ "$cert_mode" == "2" ]]; then
+    read -rp "证书文件路径 [/etc/caddy/certs/origin.pem]: " pem || return 1
+    pem="${pem:-/etc/caddy/certs/origin.pem}"
+    read -rp "私钥文件路径 [/etc/caddy/certs/origin.key]: " key || return 1
+    key="${key:-/etc/caddy/certs/origin.key}"
+    if [[ ! -f "$pem" || ! -f "$key" ]]; then
+      err "证书文件不存在：$pem 或 $key"
+      dim "先在 Cloudflare → SSL/TLS → 源服务器 → 创建证书，然后把两段分别存成这两个文件"
+      return 1
+    fi
+    email=""
+    dim "将使用已有证书，不做 ACME 验证（不需要 80 端口）"
+    dim "注意：CF Origin Certificate 只有 Cloudflare 信任，域名必须保持橙云代理"
+  fi
+
+  pub="$(get_public_ip || true)"
+  ip4="$( { getent ahostsv4 "$domain" 2>/dev/null || true; } | awk 'NR==1 { print $1; exit }' )"
   if [[ -z "$ip4" ]]; then
-    err "解析不到 $domain 的 A 记录。"
-    dim "请先把 $domain 的 A 记录指向 $pub，等生效后再试。"
-    return 1
+    err "警告：没能解析出 $domain 的 A 记录。"
+    dim "本机公网 IP: ${pub:-未知}（也可能是本机缺 getent 或 DNS 还没生效）"
+    read -rp "仍要继续（证书签发可能失败）？[y/N]: " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || { dim "已取消。"; return 1; }
   fi
   if [[ -n "$pub" && "$ip4" != "$pub" ]]; then
     err "域名解析到 $ip4，本机公网 IP 是 $pub。"
@@ -1222,7 +1242,11 @@ add_tls_ws() {
     else
       echo "$domain:$caddy_port {"
     fi
-    [[ -n "$email" ]] && echo "    tls $email"
+    if [[ "$cert_mode" == "2" ]]; then
+      echo "    tls $pem $key"
+    elif [[ -n "$email" ]]; then
+      echo "    tls $email"
+    fi
     echo "    encode gzip"
     echo "    handle $ws_path* {"
     echo "        reverse_proxy 127.0.0.1:$ws_port"
@@ -1341,8 +1365,8 @@ add_chain_relay() {
     err "没有 Caddyfile，请先运行菜单 5。"
     return 1
   fi
-  domain="$(awk '/^[A-Za-z0-9.-]+(:[0-9]+)?[[:space:]]*\{/{split($1,a,":"); print a[1]; exit}' /etc/caddy/Caddyfile)"
-  caddy_port="$(awk '/^[A-Za-z0-9.-]+:[0-9]+[[:space:]]*\{/{split($1,a,":"); print a[2]; exit}' /etc/caddy/Caddyfile)"
+  domain="$(awk '/^[A-Za-z0-9.-]+(:[0-9]+)?[[:space:]]*\{/{split($1,a,":"); print a[1]; exit}' /etc/caddy/Caddyfile 2>/dev/null || true)"
+  caddy_port="$(awk '/^[A-Za-z0-9.-]+:[0-9]+[[:space:]]*\{/{split($1,a,":"); print a[2]; exit}' /etc/caddy/Caddyfile 2>/dev/null || true)"
   caddy_port="${caddy_port:-443}"
   [[ -n "$domain" ]] || { err "没能从 Caddyfile 读出域名。"; return 1; }
 
@@ -1488,8 +1512,8 @@ add_chain_relay() {
 
 relay_list() {
   local CHAIN_DB=/etc/xray-chain.tsv domain caddy_port
-  domain="$(awk '/^[A-Za-z0-9.-]+(:[0-9]+)?[[:space:]]*\{/{split($1,a,":"); print a[1]; exit}' /etc/caddy/Caddyfile 2>/dev/null)"
-  caddy_port="$(awk '/^[A-Za-z0-9.-]+:[0-9]+[[:space:]]*\{/{split($1,a,":"); print a[2]; exit}' /etc/caddy/Caddyfile 2>/dev/null)"
+  domain="$(awk '/^[A-Za-z0-9.-]+(:[0-9]+)?[[:space:]]*\{/{split($1,a,":"); print a[1]; exit}' /etc/caddy/Caddyfile 2>/dev/null || true)"
+  caddy_port="$(awk '/^[A-Za-z0-9.-]+:[0-9]+[[:space:]]*\{/{split($1,a,":"); print a[2]; exit}' /etc/caddy/Caddyfile 2>/dev/null || true)"
   caddy_port="${caddy_port:-443}"
 
   if [[ ! -s "$CHAIN_DB" ]]; then
@@ -1607,6 +1631,155 @@ relay_menu() {
   done
 }
 
+uninstall_all() {
+  local ans
+  echo
+  echo "== 完全卸载（Xray + Caddy + 全部配置）=="
+  echo "将删除：xray、caddy、/usr/local/etc/xray、/etc/caddy、链接记录、所有备份"
+  echo "保留：/root/xray.sh（本脚本）"
+  echo
+  read -rp "确认请输入大写 YES（其它任意内容取消）: " ans || return 1
+  if [[ "$ans" != "YES" ]]; then
+    dim "已取消。"
+    return 0
+  fi
+
+  dim "停止服务..."
+  systemctl disable --now xray >/dev/null 2>&1 || true
+  systemctl disable --now caddy >/dev/null 2>&1 || true
+
+  echo "卸载 Xray-core..."
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge >/dev/null 2>&1 ||
+    dim "官方卸载脚本返回非 0，继续手动清理"
+
+  echo "卸载 Caddy..."
+  apt-get purge -y caddy >/dev/null 2>&1 || true
+  rm -rf /etc/caddy /var/lib/caddy /var/log/caddy \
+    /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+    /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null || true
+
+  echo "清理残留配置与记录..."
+  rm -rf /usr/local/etc/xray /usr/local/share/xray \
+    /etc/systemd/system/xray.service /etc/systemd/system/xray.service.d \
+    /etc/caddy-relays.tsv /etc/xray-chain.tsv /etc/xray-relays.tsv \
+    /root/Caddyfile.bak* /root/caddyfile.bak* /root/cfg.bak* \
+    /root/xray-links.txt /root/relay-links.txt \
+    /tmp/c.json /tmp/xray-*.json /tmp/caddy-* 2>/dev/null || true
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  echo
+  ok "卸载完成"
+  echo
+  echo "当前端口占用情况："
+  ss -ltnp 2>/dev/null | grep -E ':443|:80 |:8443|:2053' || echo "  已全部释放"
+  echo
+  dim "下一步：菜单 1 装 REALITY（端口建议填 8443），再菜单 5 加 TLS 入口（端口直接回车=443）"
+  dim "注意：菜单 5 只跑一次，重复跑会生成多个 WS 入站导致链接与 Caddy 不一致"
+}
+
+import_cert() {
+  local certsrc keysrc pem key a b tmpc tmpk
+  local dir=/etc/caddy/certs
+  pem="$dir/origin.pem"
+  key="$dir/origin.key"
+
+  echo
+  echo "== 导入证书文件（Cloudflare Origin Certificate）=="
+  echo "分两个文件：证书一个、私钥一个（文件名随意，内容带 BEGIN/END 即可）"
+  echo
+  read -rp "证书文件路径 [/root/origin.pem]: " certsrc || return 1
+  certsrc="${certsrc:-/root/origin.pem}"
+  certsrc="${certsrc// /}"
+  read -rp "私钥文件路径 [/root/origin.key]: " keysrc || return 1
+  keysrc="${keysrc:-/root/origin.key}"
+  keysrc="${keysrc// /}"
+
+  if [[ ! -f "$certsrc" ]]; then
+    err "找不到证书文件：$certsrc"
+    dim "上传：scp .\\origin.pem root@服务器IP:/root/origin.pem"
+    return 1
+  fi
+  if [[ ! -f "$keysrc" ]]; then
+    err "找不到私钥文件：$keysrc"
+    dim "上传：scp .\\origin.key root@服务器IP:/root/origin.key"
+    return 1
+  fi
+
+  mkdir -p "$dir" || { err "无法创建 $dir（需要 root）"; return 1; }
+
+  tmpc="$(mktemp /tmp/cert-c.XXXXXX)"
+  tmpk="$(mktemp /tmp/cert-k.XXXXXX)"
+  tr -d '\r' < "$certsrc" > "$tmpc"
+  tr -d '\r' < "$keysrc" > "$tmpk"
+
+  awk '/-----BEGIN CERTIFICATE-----/ { f = 1 }
+       f { print }
+       /-----END CERTIFICATE-----/ { if (f) { exit } }' "$tmpc" > "$pem"
+  awk '/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { f = 1 }
+       f { print }
+       /-----END [A-Z ]*PRIVATE KEY-----/ { if (f) { exit } }' "$tmpk" > "$key"
+
+  # 兼容：如果私钥文件里没找到私钥，再从证书文件里找一次（防止两个块放在同一个文件）
+  if [[ ! -s "$key" ]]; then
+    awk '/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { f = 1 }
+         f { print }
+         /-----END [A-Z ]*PRIVATE KEY-----/ { if (f) { exit } }' "$tmpc" > "$key"
+  fi
+  # 同理，证书文件里没证书时从私钥文件里找
+  if [[ ! -s "$pem" ]]; then
+    awk '/-----BEGIN CERTIFICATE-----/ { f = 1 }
+         f { print }
+         /-----END CERTIFICATE-----/ { if (f) { exit } }' "$tmpk" > "$pem"
+  fi
+  rm -f "$tmpc" "$tmpk"
+
+  if [[ ! -s "$pem" ]]; then
+    err "没找到证书块（-----BEGIN CERTIFICATE-----）"
+    return 1
+  fi
+  if [[ ! -s "$key" ]]; then
+    err "没找到私钥块（-----BEGIN PRIVATE KEY-----）"
+    dim "私钥必须和证书在同一个文件里（Cloudflare 只显示一次）"
+    return 1
+  fi
+
+  chmod 644 "$pem"
+  chmod 600 "$key"
+
+  echo
+  ok "已提取：证书 $(wc -l < "$pem") 行 / 私钥 $(wc -l < "$key") 行"
+  echo
+  if ! openssl x509 -in "$pem" -noout -subject -issuer -dates; then
+    err "证书格式不正确（可能复制时断了行）"
+    return 1
+  fi
+  if ! openssl pkey -in "$key" -noout -check >/dev/null 2>&1; then
+    dim "（该私钥类型不支持 check，跳过）"
+  fi
+
+  a="$(openssl x509 -noout -pubkey -in "$pem" 2>/dev/null | openssl dgst -md5 | awk '{print $NF}')"
+  b="$(openssl pkey -pubout -in "$key" 2>/dev/null | openssl dgst -md5 | awk '{print $NF}')"
+  echo
+  echo "公钥指纹：证书 $a / 私钥 $b"
+  if [[ -z "$a" || -z "$b" ]]; then
+    err "公钥提取失败，文件可能不完整"
+    return 1
+  fi
+  if [[ "$a" != "$b" ]]; then
+    err "证书与私钥不匹配！"
+    dim "回到 Cloudflare 重新创建一张，一次性把两段都复制好"
+    return 1
+  fi
+
+  echo
+  ok "证书已安装并校验通过"
+  ls -l "$pem" "$key"
+  echo
+  dim "下一步：菜单 5 → 证书方式选 2 → 两个路径直接回车"
+  dim "提醒：域名必须保持云端橙云代理，否则浏览器不认这张证书"
+}
+
 show_main_menu() {
   local st rp
   st="$(systemctl is-active xray 2>/dev/null || echo unknown)"
@@ -1625,8 +1798,10 @@ show_main_menu() {
   echo "  4) 端口转发管理"
   echo "  5) 添加 域名+TLS 入口（VLESS+WS+TLS，Caddy 自动签证书）"
   echo "  6) 路径中转管理（添加 / 查看 / 删除，路径随机生成）"
-  echo "  7) 查看服务状态与日志"
-  echo "  8) 退出"
+  echo "  7) 完全卸载（Xray + Caddy + 全部配置，清空重来）"
+  echo "  8) 导入证书文件（CF Origin Certificate）"
+  echo "  9) 查看服务状态与日志"
+  echo " 10) 退出"
   hr
 }
 
@@ -1636,7 +1811,7 @@ main_menu() {
   install_shortcuts >/dev/null 2>&1 || true
   while true; do
     show_main_menu
-    if ! read -rp "请选择 [1-8]: " c; then echo; break; fi
+    if ! read -rp "请选择 [1-10]: " c; then echo; break; fi
     case "$c" in
       1) install_reality; pause_key ;;
       2) show_links; pause_key ;;
@@ -1644,8 +1819,10 @@ main_menu() {
       4) fwd_menu ;;
       5) add_tls_ws; pause_key ;;
       6) relay_menu ;;
-      7) show_status; pause_key ;;
-      8|q|Q|exit) break ;;
+      7) uninstall_all; pause_key ;;
+      8) import_cert; pause_key ;;
+      9) show_status; pause_key ;;
+      10|q|Q|exit) break ;;
       "") ;;
       *) err "无效选项：$c" ;;
     esac
